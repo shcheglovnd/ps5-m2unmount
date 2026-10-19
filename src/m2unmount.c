@@ -13,9 +13,11 @@
  * running copy. It never forces: a busy volume is retried, not yanked.
  *
  * It does no periodic work while games run: it sleeps until the kernel reports
- * a mount (EVFILT_FS), then checks once after the burst settles (a launch
- * mounts dozens of sandboxes), plus a safety check every 10 minutes. One check
- * reads the mount table: ~0.2 ms with ~940 mounts.
+ * a mount or unmount (EVFILT_FS), then checks once after the burst settles (a
+ * launch mounts dozens of sandboxes), plus a safety check every 10 minutes. One
+ * check reads the mount table: ~0.2 ms with ~940 mounts. Entering rest mode
+ * breaks its status socket, so it reopens it; and it never wakes more than 10
+ * times a second, whatever happens.
  *
  *   status  TCP :9211 - connect and read a short report (nc <ps5> 9211)
  *   log     /data/m2unmount.log - events only, rotated at 256 KiB
@@ -40,13 +42,15 @@
 #include <ps5/klog.h>
 
 #define NAME     "m2unmount.elf"
-#define VERSION  "1.1"
+#define VERSION  "1.3"
 #define PORT     9211
 #define SETTLE_MS 2000                    /* after a mount event, check once it settles */
 #define MIN_GAP_S 10                      /* at most one event-driven check per 10 s */
 #define SAFETY_S  600                     /* check anyway, in case an event is missed */
 #define RETRY_S   10                      /* while an unmount keeps failing */
 #define POLL_S    60                      /* only if the kernel gives no mount events */
+#define RELISTEN_S 5                      /* reopen the status socket after it breaks */
+#define MAX_WAKES 10                      /* per second; more means something is wrong */
 #define LOG_PATH "/data/m2unmount.log"
 #define LOG_MAX  (256 * 1024)
 #define RING     16
@@ -62,8 +66,9 @@ static time_t g_start;
 static int    g_unmounts;                 /* successful unmounts since start */
 static time_t g_last_unmount;
 static int    g_failing;                  /* a failure was reported, no success since */
-static int    g_checks, g_mount_events;   /* mount-table reads; event-driven ones */
+static int    g_checks, g_bursts;         /* mount-table reads; mount/unmount bursts */
 static int    g_watching;                 /* the kernel delivers mount events */
+static long   g_wakeups;                  /* times the main loop woke up */
 static char   g_state[200] = "starting";
 static char   g_ring[RING][200];          /* recent events, for the status port */
 static int    g_ring_n;
@@ -197,7 +202,7 @@ static int sweep(int first) {
     return left;
 }
 
-static int listen_status(void) {
+static int listen_status(int tries) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) return -1;
     int one = 1;
@@ -207,10 +212,10 @@ static int listen_status(void) {
     sa.sin_family      = AF_INET;
     sa.sin_port        = htons(PORT);
     sa.sin_addr.s_addr = htonl(INADDR_ANY);
-    for (int t = 0; t < 10; t++) {            /* a replaced copy may hold it a moment */
+    for (int t = 0; t < tries; t++) {         /* a replaced copy may hold it a moment */
+        if (t) sleep(1);
         if (bind(s, (struct sockaddr *)&sa, sizeof(sa)) == 0 && listen(s, 4) == 0)
             return s;
-        sleep(1);
     }
     close(s);
     return -1;
@@ -230,10 +235,11 @@ static void serve_status(int c) {
         OUT("unmounts: 0\n");
     }
     if (g_watching)
-        OUT("checks: %d (%d after mount events), wakes on mounts + every %d min\n",
-            g_checks, g_mount_events, SAFETY_S / 60);
+        OUT("checks: %d (%d after mount/unmount bursts), wakes on mounts + every %d min; wakeups: %ld\n",
+            g_checks, g_bursts, SAFETY_S / 60, g_wakeups);
     else
-        OUT("checks: %d, every %d s (no mount events from the kernel)\n", g_checks, POLL_S);
+        OUT("checks: %d, every %d s (no mount events from the kernel); wakeups: %ld\n",
+            g_checks, POLL_S, g_wakeups);
     OUT("events:\n");
     for (int i = g_ring_n > RING ? g_ring_n - RING : 0; i < g_ring_n; i++)
         OUT("  %s\n", g_ring[i % RING]);
@@ -257,6 +263,17 @@ static int fs_events(int kq, int op) {
     return kevent(kq, &ev, 1, NULL, 0, NULL);
 }
 
+/* Open the status socket and watch it in kq; -1 if the port can't be had. */
+static int status_open(int kq, int tries) {
+    int ls = listen_status(tries);
+    if (ls >= 0 && kq >= 0) {
+        struct kevent ev;
+        EV_SET(&ev, ls, EVFILT_READ, EV_ADD, 0, 0, NULL);
+        kevent(kq, &ev, 1, NULL, 0, NULL);
+    }
+    return ls;
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     syscall(SYS_thr_set_name, -1, NAME);
@@ -275,18 +292,20 @@ int main(void) {
     else if (left == 0 && g_unmounts == 0)
         event(1, "the M.2 is not mounted - watching");
 
-    int ls = listen_status();
-    if (ls < 0) event(0, "status port %d unavailable: %s", PORT, strerror(errno));
-    if (ls >= 0 && kq >= 0) {
-        struct kevent ev;
-        EV_SET(&ev, ls, EVFILT_READ, EV_ADD, 0, 0, NULL);
-        kevent(kq, &ev, 1, NULL, 0, NULL);
+    int ls = status_open(kq, 10);
+    long relisten = 0;                        /* when to reopen a broken status socket */
+    if (ls < 0) {
+        event(0, "status port %d unavailable: %s", PORT, strerror(errno));
+        relisten = mono_ms() + 30 * 1000L;
     }
 
     long last = mono_ms(), due = 0;           /* due: the check after a mount burst */
+    long burst_start = last;                  /* wakeup rate guard */
+    int burst = 0, throttled = 0;
     for (;;) {
         long every = 1000L * (g_failing ? RETRY_S : g_watching ? SAFETY_S : POLL_S);
         long next = due && due < last + every ? due : last + every;
+        if (ls < 0 && relisten && relisten < next) next = relisten;
         long wait = next - mono_ms();
         if (wait < 0) wait = 0;
         struct timespec to = {wait / 1000, (wait % 1000) * 1000000};
@@ -297,19 +316,42 @@ int main(void) {
             int n = kevent(kq, NULL, 0, ev, 8, &to);
             if (n < 0 && errno != EINTR) sleep(1);    /* never spin */
             for (int i = 0; i < n; i++) {
-                if (ev[i].filter == EVFILT_READ) {
-                    int c = accept(ls, NULL, NULL);
-                    if (c >= 0) { serve_status(c); close(c); }
-                } else if (ev[i].filter == EVFILT_FS && (ev[i].fflags & VQ_MOUNT) && !due) {
-                    /* stop listening until the check: one wakeup per burst */
-                    g_mount_events++;
+                if (ev[i].filter == EVFILT_READ && (int)ev[i].ident == ls) {
+                    /* entering rest mode breaks listening sockets (EV_ERROR, or
+                     * accept() failing forever while kevent reports it ready) */
+                    int c = -1, broken = ev[i].flags & (EV_EOF | EV_ERROR);
+                    if (broken)
+                        errno = ev[i].flags & EV_ERROR ? (int)ev[i].data
+                              : ev[i].fflags ? (int)ev[i].fflags : ECONNRESET;
+                    else
+                        c = accept(ls, NULL, NULL);
+                    if (c >= 0) {
+                        serve_status(c);
+                        close(c);
+                    } else if (broken || (errno != EINTR && errno != EAGAIN)) {
+                        event(0, "status socket broke (flags 0x%x, %s) - reopening in %d s",
+                              ev[i].flags, strerror(errno), RELISTEN_S);
+                        close(ls);
+                        ls = -1;
+                        relisten = mono_ms() + RELISTEN_S * 1000L;
+                    }
+                } else if (ev[i].filter == EVFILT_FS && !due) {
+                    /* launching or closing an app mounts or unmounts dozens of
+                     * sandboxes: stop listening until the check, one wakeup per burst */
+                    g_bursts++;
                     fs_events(kq, EV_DELETE);
                     due = mono_ms() + SETTLE_MS;
                     if (due < last + MIN_GAP_S * 1000L) due = last + MIN_GAP_S * 1000L;
                 }
             }
         }
+        g_wakeups++;
         long now = mono_ms();
+        if (ls < 0 && relisten && now >= relisten) {
+            ls = status_open(kq, 1);
+            relisten = ls < 0 ? now + 30 * 1000L : 0;
+            if (ls >= 0) event(0, "status socket reopened");
+        }
         if ((due && now >= due) || now >= last + every) {
             if (due && fs_events(kq, EV_ADD) != 0 && g_watching) {   /* before the check */
                 g_watching = 0;
@@ -318,6 +360,14 @@ int main(void) {
             due = 0;
             sweep(0);
             last = mono_ms();
+        }
+        /* whatever happens, never wake more than MAX_WAKES times a second */
+        if (now - burst_start >= 1000) {
+            burst_start = now;
+            burst = 0;
+        } else if (++burst > MAX_WAKES) {
+            if (!throttled++) event(0, "too many wakeups - throttling to %d/s", MAX_WAKES);
+            sleep(1);
         }
     }
 }

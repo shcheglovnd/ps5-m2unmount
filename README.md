@@ -7,8 +7,9 @@ for consoles that boot Linux from that drive with
 ## Why
 
 Linux can live on the M.2 inside the console's own bfs volume (`/dev/ssd1.user`, mounted at
-`/mnt/ext1`). PS5-OS mounts that volume at every boot and marks it dirty. A session that ends
-in a kexec into Linux never unmounts it, so the next PS5 boot shows "Repairing" for the M.2.
+`/mnt/ext1`). PS5-OS mounts that volume at every boot and marks it dirty. ps5-linux-loader
+starts Linux by putting the console into rest mode and taking over on wake, so PS5-OS never
+unmounts the volume, and the next PS5 boot shows "Repairing" for the M.2.
 
 Unmounting the volume right after the jailbreak writes the clean state and keeps PS5-OS off the
 drive for the rest of the session. Tested on a CFI-1115A, firmware 4.50: after a Linux session
@@ -25,10 +26,13 @@ jailbreak starts, or etaHEN's:
 - It unmounts every volume on the M.2 (`ssd1`…`ssd9`; the internal drive is `ssd0`) and shows
   a notification.
 - It stays resident and unmounts again if the console mounts one later. It does no periodic
-  work while games run: it sleeps until the kernel reports a mount (`EVFILT_FS`), waits 2 s for
-  the burst to settle (a game launch mounts dozens of sandboxes), then checks once, at most once
-  per 10 s. A safety check runs every 10 min. One check reads the mount table, about 0.2 ms with
-  ~940 mounts.
+  work while games run: it sleeps until the kernel reports a mount or unmount (`EVFILT_FS`),
+  waits 2 s for the burst to settle (launching or closing a game mounts or unmounts dozens of
+  sandboxes), then checks once, at most once per 10 s. A safety check runs every 10 min. One
+  check reads the mount table, about 0.2 ms with ~940 mounts.
+- It survives rest mode. Entering rest mode breaks its status socket, so it reopens it. On this
+  console, waking from rest mode does not mount the M.2 again. Whatever happens, it never wakes
+  up more than 10 times a second.
 - It never forces an unmount: a busy volume is retried every 10 s, with one notification.
 - Loading it again replaces the running copy.
 - Status: `nc <ps5-ip> 9211` prints a short report.
